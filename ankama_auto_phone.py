@@ -343,30 +343,33 @@ try {
         options.add_argument("--disable-webrtc-hw-decoding")
         options.add_argument("--force-webrtc-ip-permission-check")
 
-        # Proxy setup - Use ONLY extension (command-line conflicts with extension)
+        # Proxy setup - Use Chrome's native proxy support (more reliable than extensions)
         if PROXY_HOST and PROXY_PORT:
-            # Build proxy display string
+            # Build proxy URL
             if PROXY_USER and PROXY_PASS:
-                proxy_display = f"{PROXY_SCHEME}://{PROXY_USER}:***@{PROXY_HOST}:{PROXY_PORT}"
+                # Chrome supports embedded credentials for HTTP/HTTPS proxies
+                if PROXY_SCHEME.lower() in ['http', 'https']:
+                    proxy_url = f"{PROXY_SCHEME}://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+                    proxy_display = f"{PROXY_SCHEME}://{PROXY_USER}:***@{PROXY_HOST}:{PROXY_PORT}"
+                    options.add_argument(f"--proxy-server={proxy_url}")
+                    print(f"[INFO] ✅ Using Chrome native proxy: {proxy_display}")
+                else:
+                    # For SOCKS5, we need extension (Chrome doesn't support auth in URL for SOCKS)
+                    print(f"[INFO] Creating SOCKS5 proxy extension for {PROXY_SCHEME}://{PROXY_USER}:***@{PROXY_HOST}:{PROXY_PORT}...")
+                    self._proxy_ext_path = create_simple_proxy_extension(
+                        PROXY_HOST, 
+                        PROXY_PORT, 
+                        PROXY_SCHEME, 
+                        PROXY_USER,
+                        PROXY_PASS
+                    )
+                    options.add_extension(self._proxy_ext_path)
+                    print(f"[INFO] ✅ SOCKS5 proxy extension loaded")
             else:
-                proxy_display = f"{PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}"
-            
-            # Create and load extension (ONLY method - no command-line to avoid conflicts)
-            try:
-                print(f"[INFO] Creating proxy extension for {proxy_display}...")
-                self._proxy_ext_path = create_simple_proxy_extension(
-                    PROXY_HOST, 
-                    PROXY_PORT, 
-                    PROXY_SCHEME, 
-                    PROXY_USER if PROXY_USER else None,
-                    PROXY_PASS if PROXY_PASS else None
-                )
-                options.add_extension(self._proxy_ext_path)
-                print(f"[INFO] ✅ Proxy extension loaded - using extension ONLY (no command-line to avoid conflicts)")
-            except Exception as e:
-                print(f"[ERROR] Failed to create proxy extension: {e}")
-                print(f"[ERROR] Cannot proceed without proxy extension!")
-                raise
+                # No auth needed - use command-line for all proxy types
+                proxy_url = f"{PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}"
+                options.add_argument(f"--proxy-server={proxy_url}")
+                print(f"[INFO] ✅ Using Chrome native proxy: {proxy_url}")
         else:
             print("[INFO] No proxy configured; launching direct.")
 
@@ -390,23 +393,28 @@ try {
         # Extra stealth
         self._stealthify(self.driver)
 
-        # Wait for extension to initialize and verify proxy
+        # Wait and verify proxy
         if PROXY_HOST and PROXY_PORT:
-            print("[INFO] Waiting for proxy extension to initialize...")
-            # Longer wait to ensure extension is fully loaded
-            time.sleep(4.0)
-            
-            # Navigate to a simple page to trigger extension initialization
-            try:
-                print("[INFO] Triggering extension by navigating to about:blank...")
-                self.driver.get("about:blank")
-                time.sleep(1.5)
-            except Exception as e:
-                print(f"[WARN] Navigation to trigger extension failed: {e}")
+            # If using extension (SOCKS5), wait for it to initialize
+            if hasattr(self, '_proxy_ext_path') and self._proxy_ext_path:
+                print("[INFO] Waiting for SOCKS5 proxy extension to initialize...")
+                time.sleep(3.0)
+                try:
+                    self.driver.get("about:blank")
+                    time.sleep(1.0)
+                except:
+                    pass
+            else:
+                # Command-line proxy is immediate, just brief wait
+                print("[INFO] Proxy set via command-line (immediate)")
+                time.sleep(1.0)
             
             if not SKIP_PROXY_VERIFY:
                 print("[INFO] Verifying proxy is working...")
-                self._quick_proxy_check()
+                proxy_working = self._quick_proxy_check()
+                if not proxy_working:
+                    print("[WARN] ⚠️ Proxy verification failed!")
+                    print("[WARN] Continuing anyway, but proxy may not work correctly")
             else:
                 print("[INFO] Proxy verification skipped")
         else:
