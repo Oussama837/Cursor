@@ -542,11 +542,13 @@ try {
         ua = _rand_user_agent()
         options = uc.ChromeOptions()
 
-        # Critical: Disable automation flags
+        # Critical: Disable automation flags (common fixes from online forums)
         options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option('useAutomationExtension', False)
         options.add_argument("--lang=fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7")
         options.add_argument(f"--user-agent={ua}")
-
+        
         # Window & misc
         w = random.randint(1100, 1400)
         h = random.randint(800, 1000)
@@ -574,11 +576,15 @@ try {
         options.add_argument("--disable-webrtc-hw-decoding")
         options.add_argument("--force-webrtc-ip-permission-check")
 
-        # Proxy setup - Use extension for authenticated proxies (direct proxy for browser)
+        # Proxy setup - Common solutions from GitHub/Stack Overflow:
+        # 1. Extension + --proxy-server (extension handles auth, --proxy-server helps initialization)
+        # 2. Longer wait times for extension to initialize
+        # 3. Navigate to trigger extension before making requests
         if PROXY_HOST and PROXY_PORT:
             if PROXY_USER and PROXY_PASS:
-                # Use extension for authenticated proxies (Chrome doesn't support embedded credentials)
-                print(f"[INFO] Creating proxy extension for {PROXY_SCHEME}://{PROXY_USER}:***@{PROXY_HOST}:{PROXY_PORT}...")
+                print(f"[INFO] Setting up proxy: {PROXY_SCHEME}://{PROXY_USER}:***@{PROXY_HOST}:{PROXY_PORT}")
+                
+                # Create extension (standard solution for authenticated proxies)
                 try:
                     self._proxy_ext_path = create_simple_proxy_extension(
                         PROXY_HOST,
@@ -588,10 +594,17 @@ try {
                         PROXY_PASS
                     )
                     options.add_extension(self._proxy_ext_path)
-                    print(f"[INFO] ✅ Proxy extension loaded - browser will use proxy directly")
+                    print(f"[INFO] ✅ Proxy extension loaded")
+                    
+                    # Common workaround: Also set --proxy-server (found in undetected-chromedriver GitHub issues)
+                    # Extension takes precedence for auth, but --proxy-server helps with initialization
+                    options.add_argument(f"--proxy-server={PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}")
+                    print(f"[INFO] ✅ Also set --proxy-server (extension handles auth)")
                 except Exception as e:
                     print(f"[ERROR] Failed to create proxy extension: {e}")
-                    raise
+                    # Fallback: try without extension (won't work with auth)
+                    options.add_argument(f"--proxy-server={PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}")
+                    print(f"[WARN] Extension failed, using --proxy-server only (auth won't work)")
             else:
                 # No auth - use command-line directly
                 proxy_url = f"{PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}"
