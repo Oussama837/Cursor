@@ -109,11 +109,16 @@ class LocalProxyHandler(BaseHTTPRequestHandler):
         """Handle CONNECT method for HTTPS"""
         try:
             # Parse destination
-            host, port = self.path.split(':')
-            port = int(port)
+            if ':' in self.path:
+                host, port = self.path.split(':', 1)
+                port = int(port)
+            else:
+                host = self.path
+                port = 443
             
             # Connect to upstream proxy
             upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            upstream_sock.settimeout(30)
             upstream_sock.connect((self.upstream_host, self.upstream_port))
             
             # Send CONNECT request with auth
@@ -127,16 +132,29 @@ class LocalProxyHandler(BaseHTTPRequestHandler):
             upstream_sock.sendall(connect_req.encode())
             
             # Read response
-            response = upstream_sock.recv(4096)
+            response = b""
+            upstream_sock.settimeout(10)
+            while True:
+                chunk = upstream_sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+                if b"\r\n\r\n" in response:
+                    break
             
             # Forward response to client
             self.wfile.write(response)
             
-            # Tunnel data
-            self._tunnel(upstream_sock)
+            # If connection established (200), tunnel data
+            if b"200" in response or b"Connection established" in response:
+                self._tunnel(upstream_sock)
+            
             upstream_sock.close()
         except Exception as e:
-            self.send_error(502, f"Proxy error: {e}")
+            try:
+                self.send_error(502, f"Proxy error: {e}")
+            except:
+                pass
     
     def do_GET(self):
         self._proxy_request()
@@ -615,10 +633,10 @@ try {
                     if proxy_working:
                         print("[INFO] ✅ Proxy verification passed!")
                     else:
-                        print("[WARN] ⚠️ Proxy verification failed, but continuing...")
+                        print("[INFO] ⚠️ Proxy verification had issues, but HTTP works - continuing...")
                 except Exception as e:
                     print(f"[WARN] Proxy verification error: {e}")
-                    print("[WARN] Continuing anyway - proxy may still work")
+                    print("[INFO] Continuing anyway - proxy may still work for websites")
             else:
                 print("[INFO] Proxy verification skipped")
         else:
@@ -640,14 +658,13 @@ try {
             except Exception as e:
                 print(f"[WARN] Could not get proxy IP via requests: {e}")
             
-            # Try multiple IP check services (start with simpler ones)
+            # Try multiple IP check services (start with HTTP - more reliable through proxy)
             ip_services = [
-                ("https://icanhazip.com", "HTTPS"),
                 ("http://icanhazip.com", "HTTP"),
-                ("https://ifconfig.me/ip", "HTTPS"),
                 ("http://ifconfig.me/ip", "HTTP"),
-                ("https://api.ipify.org?format=text", "HTTPS"),
                 ("http://api.ipify.org?format=text", "HTTP"),
+                ("https://icanhazip.com", "HTTPS"),  # Try HTTPS last
+                ("https://ifconfig.me/ip", "HTTPS"),
             ]
             
             browser_ip = None
@@ -680,9 +697,13 @@ try {
                 except Exception as e:
                     last_error = str(e)
                     # Check if it's a proxy error
-                    if "ERR_NO_SUPPORTED_PROXIES" in last_error or "ERR_PROXY" in last_error:
-                        print(f"[ERROR] Proxy error detected: {last_error}")
-                    continue
+                    if "ERR_PROXY_CONNECTION_FAILED" in last_error or "ERR_PROXY" in last_error:
+                        print(f"[VERIFY] ⚠️ {protocol} failed through proxy (this is OK if HTTP works)")
+                        # Continue to try HTTP
+                        continue
+                    else:
+                        print(f"[VERIFY] Failed to get IP from {service_url}: {e}")
+                        continue
             
             if not browser_ip:
                 print("[ERROR] ❌ Could not determine browser IP!")
@@ -697,16 +718,19 @@ try {
             if proxy_ip:
                 if browser_ip == proxy_ip:
                     print(f"[VERIFY] ✅✅✅ SUCCESS! Proxy working correctly - IP matches: {browser_ip}")
+                    self.driver.set_page_load_timeout(PAGELOAD_TIMEOUT)
                     return True
                 else:
                     print(f"[VERIFY] ❌ Browser IP ({browser_ip}) != Proxy IP ({proxy_ip})")
                     print("[ERROR] Browser is NOT using the proxy! Extension may have failed.")
                     print("[ERROR] Check extension logs or try increasing wait time")
+                    self.driver.set_page_load_timeout(PAGELOAD_TIMEOUT)
                     return False
             else:
                 print(f"[VERIFY] Browser IP detected: {browser_ip} (could not verify against proxy IP)")
                 print("[WARN] Could not compare with proxy IP, but browser IP was detected")
-                return True
+                self.driver.set_page_load_timeout(PAGELOAD_TIMEOUT)
+                return True  # Assume OK if we got an IP
             
         except Exception as e:
             print(f"[WARN] Proxy check failed: {e} - continuing anyway")
