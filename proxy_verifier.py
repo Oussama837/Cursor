@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - optional dependency
 
 ITERATIONS = 5
 IP_CHECK_URL = "https://api.ipify.org?format=json"
+IP_BROWSER_URL = "https://www.whatismyip.com"
 
 
 logging.basicConfig(
@@ -139,6 +140,14 @@ def fetch_ip_with_selenium(driver) -> str:
     return ip_address
 
 
+def browse_ip_page(driver, url: str = IP_BROWSER_URL) -> None:
+    """Open an additional IP-checking website to visually confirm the proxy."""
+    logging.info("Opening browser IP verification page: %s", url)
+    driver.get(url)
+    time.sleep(5)
+    logging.info("Page title: %s", driver.title)
+
+
 def verify_proxy_iteration(iteration: int, proxy_url: str, config: dict) -> None:
     logging.info("=== Iteration %d/%d ===", iteration, ITERATIONS)
     renew_hypeproxy_ip(config.get("change_ip_url"))
@@ -153,6 +162,7 @@ def verify_proxy_iteration(iteration: int, proxy_url: str, config: dict) -> None
             pageload_timeout=config.get("pageload_timeout", 40),
         )
         observed_ip = fetch_ip_with_selenium(driver)
+        browse_ip_page(driver)
         if expected_ip != observed_ip:
             raise RuntimeError(
                 f"Proxy verification failed: requests saw {expected_ip}, "
