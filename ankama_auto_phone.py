@@ -324,28 +324,47 @@ def create_simple_proxy_extension(proxy_host, proxy_port, proxy_scheme, proxy_us
 // Set proxy immediately when extension loads
 var config = {json.dumps(proxy_config)};
 
+// Function to set proxy
+function setProxy() {{
+    chrome.proxy.settings.set({{value: config, scope: "regular"}}, function(details) {{
+        if (chrome.runtime.lastError) {{
+            console.error("Proxy setup error:", chrome.runtime.lastError);
+        }} else {{
+            console.log("Proxy configured successfully:", config);
+        }}
+    }});
+}}
+
+// Set proxy immediately when script loads
+setProxy();
+
 // Set proxy on startup
 chrome.runtime.onStartup.addListener(function() {{
-    chrome.proxy.settings.set({{value: config, scope: "regular"}}, function(details) {{
-        console.log("Proxy set on startup:", config);
-    }});
+    setProxy();
 }});
 
-// Set proxy immediately
-chrome.proxy.settings.set({{value: config, scope: "regular"}}, function(details) {{
-    if (chrome.runtime.lastError) {{
-        console.error("Proxy setup error:", chrome.runtime.lastError);
-    }} else {{
-        console.log("Proxy configured successfully:", config);
-    }}
+// Set proxy when extension is installed/enabled
+chrome.runtime.onInstalled.addListener(function() {{
+    setProxy();
 }});
 
-// Ensure proxy persists
+// Ensure proxy persists - reapply if changed
 chrome.proxy.settings.onChange.addListener(function(details) {{
     if (details.levelOfControl !== "controlled_by_this_extension") {{
-        chrome.proxy.settings.set({{value: config, scope: "regular"}}, function() {{}});
+        console.log("Proxy settings changed, reapplying...");
+        setProxy();
     }}
 }});
+
+// Reapply proxy periodically to ensure it stays set
+setInterval(function() {{
+    chrome.proxy.settings.get({{}}, function(details) {{
+        if (!details.value || details.value.mode !== "fixed_servers") {{
+            console.log("Proxy not set, reapplying...");
+            setProxy();
+        }}
+    }});
+}}, 5000); // Check every 5 seconds
 
 """
     
@@ -604,12 +623,41 @@ try {
         # Wait and verify proxy
         if PROXY_HOST and PROXY_PORT:
             if PROXY_USER and PROXY_PASS:
-                # Extension method - wait for it to initialize
+                # Extension method - wait longer for it to initialize
                 print("[INFO] Waiting for proxy extension to initialize...")
-                time.sleep(4.0)
+                time.sleep(5.0)  # Increased wait time
+                
+                # Navigate to trigger extension
                 try:
+                    print("[INFO] Triggering extension by navigating...")
                     self.driver.get("about:blank")
-                    time.sleep(2.0)
+                    time.sleep(3.0)  # Give extension more time
+                    
+                    # Try to verify extension is loaded and proxy is set
+                    try:
+                        # Check if extension loaded
+                        ext_status = self.driver.execute_script("""
+                            return typeof chrome !== 'undefined' && 
+                                   typeof chrome.proxy !== 'undefined' ? 'Extension API available' : 'No extension API';
+                        """)
+                        print(f"[DEBUG] Extension API check: {ext_status}")
+                        
+                        # Try to verify proxy is actually set via CDP
+                        try:
+                            self.driver.execute_cdp_cmd("Network.enable", {})
+                            print("[DEBUG] Network domain enabled - checking proxy...")
+                        except:
+                            pass
+                    except:
+                        pass
+                    
+                    # Force a test navigation to ensure proxy is applied
+                    try:
+                        print("[DEBUG] Testing proxy with a simple request...")
+                        self.driver.get("http://httpbin.org/ip")
+                        time.sleep(2.0)
+                    except:
+                        pass
                 except Exception as e:
                     print(f"[WARN] Navigation failed: {e}")
             else:
@@ -624,7 +672,12 @@ try {
                     if proxy_working:
                         print("[INFO] ✅ Proxy verification passed!")
                     else:
-                        print("[INFO] ⚠️ Proxy verification had issues, but HTTP works - continuing...")
+                        print("[WARN] ⚠️ Proxy verification failed - browser may not be using proxy")
+                        print("[WARN] This could be due to:")
+                        print("[WARN]   1. Extension not loading properly with undetected-chromedriver")
+                        print("[WARN]   2. Proxy server rejecting connections")
+                        print("[WARN]   3. Network/firewall issues")
+                        print("[WARN] Continuing anyway - proxy might still work for some websites")
                 except Exception as e:
                     print(f"[WARN] Proxy verification error: {e}")
                     print("[INFO] Continuing anyway - proxy may still work for websites")
