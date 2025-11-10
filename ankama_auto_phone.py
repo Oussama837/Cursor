@@ -78,6 +78,21 @@ def _rand_user_agent():
     ]
     return random.choice(bases)
 
+def create_proxy_pac_file(proxy_host, proxy_port, proxy_scheme, proxy_user=None, proxy_pass=None):
+    """
+    Create a PAC (Proxy Auto-Configuration) file for proxy with auth.
+    Note: PAC files don't support auth directly, but we'll use it with extension for auth.
+    """
+    pac_content = f"""
+function FindProxyForURL(url, host) {{
+    return "PROXY {proxy_host}:{proxy_port}";
+}}
+"""
+    pac_file = tempfile.NamedTemporaryFile(mode='w', suffix='.pac', delete=False)
+    pac_file.write(pac_content)
+    pac_file.close()
+    return pac_file.name
+
 def create_simple_proxy_extension(proxy_host, proxy_port, proxy_scheme, proxy_user=None, proxy_pass=None):
     """
     Create a minimal Chrome extension for proxy with auth support.
@@ -343,19 +358,14 @@ try {
         options.add_argument("--disable-webrtc-hw-decoding")
         options.add_argument("--force-webrtc-ip-permission-check")
 
-        # Proxy setup - Use Chrome's native proxy support (more reliable than extensions)
+        # Proxy setup - ALWAYS use extension for authenticated proxies (Chrome doesn't support auth in --proxy-server)
         if PROXY_HOST and PROXY_PORT:
-            # Build proxy URL
+            proxy_display = f"{PROXY_SCHEME}://{PROXY_USER}:***@{PROXY_HOST}:{PROXY_PORT}" if (PROXY_USER and PROXY_PASS) else f"{PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}"
+            
+            # Always use extension when auth is required (Chrome's --proxy-server doesn't support embedded credentials properly)
             if PROXY_USER and PROXY_PASS:
-                # Chrome supports embedded credentials for HTTP/HTTPS proxies
-                if PROXY_SCHEME.lower() in ['http', 'https']:
-                    proxy_url = f"{PROXY_SCHEME}://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
-                    proxy_display = f"{PROXY_SCHEME}://{PROXY_USER}:***@{PROXY_HOST}:{PROXY_PORT}"
-                    options.add_argument(f"--proxy-server={proxy_url}")
-                    print(f"[INFO] ✅ Using Chrome native proxy: {proxy_display}")
-                else:
-                    # For SOCKS5, we need extension (Chrome doesn't support auth in URL for SOCKS)
-                    print(f"[INFO] Creating SOCKS5 proxy extension for {PROXY_SCHEME}://{PROXY_USER}:***@{PROXY_HOST}:{PROXY_PORT}...")
+                print(f"[INFO] Creating proxy extension for {proxy_display}...")
+                try:
                     self._proxy_ext_path = create_simple_proxy_extension(
                         PROXY_HOST, 
                         PROXY_PORT, 
@@ -364,12 +374,15 @@ try {
                         PROXY_PASS
                     )
                     options.add_extension(self._proxy_ext_path)
-                    print(f"[INFO] ✅ SOCKS5 proxy extension loaded")
+                    print(f"[INFO] ✅ Proxy extension loaded (required for authenticated proxies)")
+                except Exception as e:
+                    print(f"[ERROR] Failed to create proxy extension: {e}")
+                    raise
             else:
-                # No auth needed - use command-line for all proxy types
+                # No auth - can use command-line
                 proxy_url = f"{PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}"
                 options.add_argument(f"--proxy-server={proxy_url}")
-                print(f"[INFO] ✅ Using Chrome native proxy: {proxy_url}")
+                print(f"[INFO] ✅ Using Chrome native proxy (no auth): {proxy_url}")
         else:
             print("[INFO] No proxy configured; launching direct.")
 
@@ -395,26 +408,32 @@ try {
 
         # Wait and verify proxy
         if PROXY_HOST and PROXY_PORT:
-            # If using extension (SOCKS5), wait for it to initialize
-            if hasattr(self, '_proxy_ext_path') and self._proxy_ext_path:
-                print("[INFO] Waiting for SOCKS5 proxy extension to initialize...")
-                time.sleep(3.0)
+            # If using extension (authenticated proxies), wait for it to initialize
+            if PROXY_USER and PROXY_PASS:
+                print("[INFO] Waiting for proxy extension to initialize...")
+                time.sleep(4.0)  # Longer wait for extension
                 try:
+                    print("[INFO] Triggering extension by navigating...")
                     self.driver.get("about:blank")
-                    time.sleep(1.0)
-                except:
-                    pass
+                    time.sleep(2.0)  # Give extension time to set proxy
+                except Exception as e:
+                    print(f"[WARN] Navigation failed: {e}")
             else:
-                # Command-line proxy is immediate, just brief wait
+                # Command-line proxy is immediate
                 print("[INFO] Proxy set via command-line (immediate)")
                 time.sleep(1.0)
             
             if not SKIP_PROXY_VERIFY:
                 print("[INFO] Verifying proxy is working...")
-                proxy_working = self._quick_proxy_check()
-                if not proxy_working:
-                    print("[WARN] ⚠️ Proxy verification failed!")
-                    print("[WARN] Continuing anyway, but proxy may not work correctly")
+                try:
+                    proxy_working = self._quick_proxy_check()
+                    if not proxy_working:
+                        print("[WARN] ⚠️ Proxy verification failed!")
+                        print("[WARN] This might be a false negative - proxy may still work for actual websites")
+                        print("[WARN] Continuing execution...")
+                except Exception as e:
+                    print(f"[WARN] Proxy verification error: {e}")
+                    print("[WARN] Continuing anyway - proxy may still work")
             else:
                 print("[INFO] Proxy verification skipped")
         else:
@@ -485,8 +504,9 @@ try {
                 if last_error:
                     print(f"[ERROR] Last error: {last_error}")
                 print("[ERROR] Proxy extension may not be working correctly")
+                print("[INFO] However, proxy might still work for actual websites - continuing...")
                 self.driver.set_page_load_timeout(PAGELOAD_TIMEOUT)
-                return False
+                return False  # Return False but don't block execution
             
             # Compare with proxy IP
             if proxy_ip:
