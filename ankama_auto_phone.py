@@ -621,29 +621,60 @@ try {
         except Exception as e:
             print(f"[WARN] Failed to launch with version_main=142: {e}")
             print("[WARN] Trying without version pinning...")
-            # Cannot reuse options object - need to rebuild it
-            # Create fresh options
-            options_retry = uc.ChromeOptions()
-            for arg in options.arguments:
-                options_retry.add_argument(arg)
-            if hasattr(options, '_experimental_options'):
-                for key, value in options._experimental_options.items():
-                    options_retry.add_experimental_option(key, value)
-            # Re-add extensions (check if file exists first)
-            if PROXY_HOST and PROXY_PORT and PROXY_USER and PROXY_PASS:
-                if hasattr(self, '_proxy_ext_path') and self._proxy_ext_path and Path(self._proxy_ext_path).exists():
-                    options_retry.add_extension(self._proxy_ext_path)
-                    print(f"[INFO] Re-added proxy extension")
-                else:
-                    # Extension file missing, recreate it
-                    print(f"[WARN] Extension file missing, recreating...")
-                    self._proxy_ext_path = create_simple_proxy_extension(
-                        PROXY_HOST, PROXY_PORT, PROXY_SCHEME, PROXY_USER, PROXY_PASS
-                    )
-                    options_retry.add_extension(self._proxy_ext_path)
-                    options_retry.add_argument(f"--proxy-server={PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}")
-                    print(f"[INFO] Recreated and added proxy extension")
+            # Cannot reuse options - rebuild completely from scratch
             try:
+                ua_retry = _rand_user_agent()
+                options_retry = uc.ChromeOptions()
+                
+                # Re-add all settings properly (don't copy, rebuild)
+                options_retry.add_argument("--disable-blink-features=AutomationControlled")
+                options_retry.add_experimental_option("excludeSwitches", ["enable-automation"])
+                options_retry.add_experimental_option('useAutomationExtension', False)
+                options_retry.add_argument("--lang=fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7")
+                options_retry.add_argument(f"--user-agent={ua_retry}")
+                
+                w = random.randint(1100, 1400)
+                h = random.randint(800, 1000)
+                options_retry.add_argument(f"--window-size={w},{h}")
+                options_retry.add_argument("--no-default-browser-check")
+                options_retry.add_argument("--no-first-run")
+                options_retry.add_argument("--force-color-profile=srgb")
+                options_retry.page_load_strategy = "eager"
+                
+                if HEADLESS:
+                    options_retry.add_argument("--headless=new")
+                
+                options_retry.add_experimental_option("prefs", {
+                    "webrtc.ip_handling_policy": "disable_non_proxied_udp",
+                    "webrtc.multiple_routes_enabled": False,
+                    "webrtc.nonproxied_udp_enabled": False,
+                    "profile.default_content_setting_values.media_stream_mic": 2,
+                    "profile.default_content_setting_values.media_stream_camera": 2,
+                })
+                
+                options_retry.add_argument("--disable-webrtc")
+                options_retry.add_argument("--disable-webrtc-hw-encoding")
+                options_retry.add_argument("--disable-webrtc-hw-decoding")
+                options_retry.add_argument("--force-webrtc-ip-permission-check")
+                
+                # Re-add proxy settings
+                if PROXY_HOST and PROXY_PORT:
+                    if PROXY_USER and PROXY_PASS:
+                        if hasattr(self, '_proxy_ext_path') and self._proxy_ext_path and Path(self._proxy_ext_path).exists():
+                            options_retry.add_extension(self._proxy_ext_path)
+                            print(f"[INFO] Re-added proxy extension")
+                        else:
+                            print(f"[WARN] Extension file missing, recreating...")
+                            self._proxy_ext_path = create_simple_proxy_extension(
+                                PROXY_HOST, PROXY_PORT, PROXY_SCHEME, PROXY_USER, PROXY_PASS
+                            )
+                            options_retry.add_extension(self._proxy_ext_path)
+                            print(f"[INFO] Recreated proxy extension")
+                        options_retry.add_argument(f"--proxy-server={PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}")
+                    else:
+                        proxy_url = f"{PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}"
+                        options_retry.add_argument(f"--proxy-server={proxy_url}")
+                
                 driver = uc.Chrome(options=options_retry)
                 print("[INFO] Chrome launched successfully (without version pinning)")
             except Exception as e2:
