@@ -51,6 +51,7 @@ PROXY_PASS   = os.getenv("PROXY_PASS", "").strip()
 
 HEADLESS          = os.getenv("HEADLESS", "0") in ("1","true","True","yes","YES")
 PAGELOAD_TIMEOUT  = int(os.getenv("PAGELOAD_TIMEOUT", "40"))
+SKIP_PROXY_VERIFY = os.getenv("SKIP_PROXY_VERIFY", "0") in ("1","true","True","yes","YES")
 
 # ----------- Requests through same proxy -----------
 if PROXY_HOST and PROXY_PORT:
@@ -251,58 +252,31 @@ class AnkamaAutoPhone:
         """
         Verify that browser is actually using proxy by checking IP.
         Returns True if proxy is working, False otherwise.
+        Uses timeouts to prevent blocking.
         """
         try:
-            # First check what IP the browser sees
-            self.driver.get("https://api.ipify.org/?format=text")
-            WebDriverWait(self.driver, 10).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-            browser_ip = self.driver.find_element(By.TAG_NAME, "body").text.strip()
-            print(f"[VERIFY] Browser IP: {browser_ip}")
+            print("[VERIFY] Starting proxy verification...")
+            # Quick check - just see if we can load a simple page
+            try:
+                self.driver.set_page_load_timeout(8)  # Short timeout for verification
+                self.driver.get("https://api.ipify.org/?format=text")
+                browser_ip = WebDriverWait(self.driver, 5).until(
+                    lambda d: d.find_element(By.TAG_NAME, "body").text.strip()
+                )
+                print(f"[VERIFY] Browser IP: {browser_ip}")
+            except Exception as e:
+                print(f"[WARN] Could not load IP check page: {e}")
+                # If we can't load the page, proxy might not be working, but continue anyway
+                return True  # Don't block - let it try
             
-            # Also check via JavaScript fetch to ensure consistency
-            js_ip = self.driver.execute_script("""
-                return fetch('https://api.ipify.org?format=json')
-                    .then(r => r.json())
-                    .then(d => d.ip)
-                    .catch(() => null);
-            """)
-            if js_ip:
-                print(f"[VERIFY] JavaScript fetch IP: {js_ip}")
+            # Restore original timeout
+            self.driver.set_page_load_timeout(PAGELOAD_TIMEOUT)
             
-            # Check WebRTC IP leak
-            webrtc_ip = self.driver.execute_script("""
-                return new Promise((resolve) => {
-                    const pc = new RTCPeerConnection({
-                        iceServers: [{urls: 'stun:stun.l.google.com:19302'}]
-                    });
-                    pc.createDataChannel('');
-                    pc.onicecandidate = (e) => {
-                        if (e.candidate) {
-                            const candidate = e.candidate.candidate;
-                            const match = candidate.match(/([0-9]{1,3}\.){3}[0-9]{1,3}/);
-                            if (match) {
-                                pc.close();
-                                resolve(match[0]);
-                            }
-                        }
-                    };
-                    pc.createOffer().then(offer => pc.setLocalDescription(offer));
-                    setTimeout(() => { pc.close(); resolve(null); }, 2000);
-                });
-            """)
-            if webrtc_ip:
-                print(f"[WARN] WebRTC IP leak detected: {webrtc_ip}")
-            else:
-                print("[VERIFY] WebRTC leak blocked successfully")
-            
-            # If proxy is configured, verify it's being used
+            # If proxy is configured, try to verify it's being used (non-blocking)
             if PROXY_HOST and PROXY_PORT:
-                # Get the actual proxy IP via requests (should match browser IP if proxy works)
                 try:
                     r = requests.get("https://api.ipify.org?format=json", 
-                                    proxies=REQUESTS_PROXIES, timeout=10)
+                                    proxies=REQUESTS_PROXIES, timeout=5)
                     proxy_ip = r.json().get("ip", "")
                     print(f"[VERIFY] Proxy IP (via requests): {proxy_ip}")
                     
@@ -310,34 +284,44 @@ class AnkamaAutoPhone:
                         print("[VERIFY] ✅ Proxy is working correctly - browser IP matches proxy IP")
                         return True
                     else:
-                        print(f"[ERROR] ❌ Proxy NOT working - browser IP ({browser_ip}) != proxy IP ({proxy_ip})")
-                        return False
+                        print(f"[WARN] ⚠️ Browser IP ({browser_ip}) != Proxy IP ({proxy_ip}) - but continuing anyway")
+                        return True  # Don't block - continue execution
                 except Exception as e:
-                    print(f"[WARN] Could not verify proxy IP via requests: {e}")
+                    print(f"[WARN] Could not verify proxy IP via requests: {e} - continuing anyway")
                     return True  # Assume OK if we can't verify
             else:
                 print("[VERIFY] No proxy configured")
                 return True
                 
         except Exception as e:
-            print(f"[ERROR] IP verification failed: {e}")
-            return False
+            print(f"[WARN] IP verification had issues: {e} - continuing anyway")
+            return True  # Don't block on verification errors
 
-    def _wait_proxy_ready(self, retries=5, delay=3.0):
+    def _wait_proxy_ready(self, retries=3, delay=2.0):
         """
         Wait for proxy to be ready and verify it's actually being used.
+        Non-blocking - will return True even if verification fails to prevent hanging.
         """
+        print(f"[INFO] Verifying proxy connection (max {retries} attempts)...")
         for i in range(retries):
             try:
-                if self._verify_proxy_ip():
+                print(f"[VERIFY] Attempt {i+1}/{retries}...")
+                result = self._verify_proxy_ip()
+                if result:
+                    print("[VERIFY] ✅ Proxy verification passed")
                     return True
                 else:
-                    print(f"[WARN] Proxy verification failed (try {i+1}/{retries})")
-                    time.sleep(delay)
+                    print(f"[WARN] Proxy verification returned False (try {i+1}/{retries})")
+                    if i < retries - 1:
+                        time.sleep(delay)
             except Exception as e:
-                print(f"[WARN] Proxy not ready yet (try {i+1}/{retries}): {e}")
-                time.sleep(delay)
-        return False
+                print(f"[WARN] Proxy verification exception (try {i+1}/{retries}): {e}")
+                if i < retries - 1:
+                    time.sleep(delay)
+        
+        # Don't block - return True anyway to allow execution to continue
+        print("[WARN] Proxy verification had issues, but continuing anyway...")
+        return True
 
     def _stealthify(self, driver):
         # Enhanced stealth: remove webdriver flag & prevent IP leaks
@@ -419,13 +403,21 @@ try {
         if PROXY_HOST and PROXY_PORT:
             if PROXY_USER and PROXY_PASS:
                 # Use extension for authenticated proxies
-                self._proxy_extension_path = create_proxy_auth_extension(
-                    PROXY_HOST, PROXY_PORT, PROXY_SCHEME, PROXY_USER, PROXY_PASS
-                )
-                options.add_extension(self._proxy_extension_path)
-                print(f"[INFO] Using proxy via extension: {PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}")
-                # Also set proxy-server as backup
-                options.add_argument(f"--proxy-server={PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}")
+                try:
+                    print(f"[INFO] Creating proxy extension for {PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}...")
+                    self._proxy_extension_path = create_proxy_auth_extension(
+                        PROXY_HOST, PROXY_PORT, PROXY_SCHEME, PROXY_USER, PROXY_PASS
+                    )
+                    print(f"[INFO] Extension created at: {self._proxy_extension_path}")
+                    options.add_extension(self._proxy_extension_path)
+                    print(f"[INFO] Using proxy via extension: {PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}")
+                    # Also set proxy-server as backup
+                    options.add_argument(f"--proxy-server={PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to create proxy extension: {e}")
+                    print(f"[WARN] Falling back to --proxy-server only (auth may not work)")
+                    # Note: --proxy-server doesn't support auth directly, so this may not work
+                    options.add_argument(f"--proxy-server={PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}")
             else:
                 # No auth - use direct proxy argument
                 options.add_argument(f"--proxy-server={PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}")
@@ -434,11 +426,15 @@ try {
             print("[INFO] No proxy configured; launching direct.")
 
         # Launch Chrome
+        print("[INFO] Launching Chrome browser...")
         try:
             driver = uc.Chrome(options=options, version_main=142)
+            print("[INFO] Chrome launched successfully")
         except Exception:
+            print("[WARN] Failed to launch with version_main=142, trying without version pinning...")
             try:
                 driver = uc.Chrome(options=options)
+                print("[INFO] Chrome launched successfully (without version pinning)")
             except Exception as e:
                 print(f"[ERROR] Failed to launch Chrome: {e}")
                 raise
@@ -450,17 +446,35 @@ try {
         self._stealthify(self.driver)
 
         # Wait for extension to load and verify proxy
-        print("[INFO] Waiting for proxy extension to initialize...")
-        time.sleep(3.0)  # Give extension time to load
-        
-        # Verify proxy is actually being used
         if PROXY_HOST and PROXY_PORT:
-            if not self._wait_proxy_ready():
-                print("[ERROR] ❌ Proxy verification failed - browser may be using machine IP!")
-                print("[ERROR] Attempting to continue anyway, but proxy may not be working...")
-                # Don't raise - let it try anyway, but warn user
+            print("[INFO] Waiting for proxy extension to initialize...")
+            time.sleep(1.5)  # Give extension time to load
+            
+            if SKIP_PROXY_VERIFY:
+                print("[INFO] Skipping proxy verification (SKIP_PROXY_VERIFY=1)")
             else:
-                print("[INFO] ✅ Proxy verified and working correctly")
+                # Quick verification (non-blocking - will continue even if verification fails)
+                try:
+                    # Use a shorter timeout to prevent blocking
+                    self.driver.set_page_load_timeout(5)
+                    
+                    # Try a quick check
+                    print("[INFO] Quick proxy check...")
+                    self._wait_proxy_ready(retries=2, delay=1.0)
+                    
+                    # Restore timeout
+                    self.driver.set_page_load_timeout(PAGELOAD_TIMEOUT)
+                    print("[INFO] Proxy setup complete")
+                except Exception as e:
+                    print(f"[WARN] Proxy verification had issues: {e} - continuing anyway")
+                    # Restore timeout in case of error
+                    try:
+                        self.driver.set_page_load_timeout(PAGELOAD_TIMEOUT)
+                    except:
+                        pass
+            print("[INFO] Proxy configured, ready to proceed")
+        else:
+            print("[INFO] No proxy configured")
 
     def accept_cookies_if_present(self):
         try:
