@@ -18,6 +18,9 @@ import json
 import random
 import requests
 import warnings
+import tempfile
+import zipfile
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -75,7 +78,78 @@ def _rand_user_agent():
     ]
     return random.choice(bases)
 
-# Removed extension-based proxy - using CDP instead
+def create_simple_proxy_extension(proxy_host, proxy_port, proxy_scheme, proxy_user=None, proxy_pass=None):
+    """
+    Create a minimal Chrome extension for proxy with auth support.
+    Works for HTTP, HTTPS, and SOCKS5 proxies.
+    """
+    manifest = {
+        "version": "1.0.0",
+        "manifest_version": 2,
+        "name": "Proxy Extension",
+        "permissions": ["proxy", "webRequest", "webRequestBlocking", "<all_urls>"],
+        "background": {
+            "scripts": ["background.js"],
+            "persistent": True
+        }
+    }
+    
+    # Build proxy config
+    proxy_config = {
+        "mode": "fixed_servers",
+        "rules": {
+            "singleProxy": {
+                "scheme": proxy_scheme,
+                "host": proxy_host,
+                "port": proxy_port
+            },
+            "bypassList": ["localhost", "127.0.0.1"]
+        }
+    }
+    
+    background_js = f"""
+var config = {json.dumps(proxy_config)};
+
+chrome.proxy.settings.set({{value: config, scope: "regular"}}, function(details) {{
+    console.log("Proxy configured:", config);
+}});
+
+"""
+    
+    # Add auth handler if credentials provided
+    if proxy_user and proxy_pass:
+        background_js += f"""
+function handleAuth(details) {{
+    return {{
+        authCredentials: {{
+            username: "{proxy_user}",
+            password: "{proxy_pass}"
+        }}
+    }};
+}}
+
+chrome.webRequest.onAuthRequired.addListener(
+    handleAuth,
+    {{urls: ["<all_urls>"]}},
+    ["blocking"]
+);
+"""
+    
+    # Create extension directory
+    tmpdir = tempfile.mkdtemp(prefix="proxy_ext_")
+    manifest_path = Path(tmpdir) / "manifest.json"
+    background_path = Path(tmpdir) / "background.js"
+    
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+    background_path.write_text(background_js, encoding='utf-8')
+    
+    # Create zip
+    zip_path = Path(tempfile.gettempdir()) / f"proxy_{int(time.time())}.zip"
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zp:
+        zp.write(manifest_path, arcname="manifest.json")
+        zp.write(background_path, arcname="background.js")
+    
+    return str(zip_path)
 
 # ----------- OnlineSim helpers -----------
 def get_virtual_number(service='ankama', country=33):
@@ -143,6 +217,7 @@ def get_balance():
 class AnkamaAutoPhone:
     def __init__(self):
         self.driver = None
+        self._proxy_ext_path = None
 
     def random_delay(self, a=0.5, b=1.5):
         time.sleep(random.uniform(a, b))
@@ -237,22 +312,32 @@ try {
         options.add_argument("--disable-webrtc-hw-decoding")
         options.add_argument("--force-webrtc-ip-permission-check")
 
-        # Proxy setup - Using --proxy-server with URL-embedded auth (works for HTTP/HTTPS proxies)
+        # Proxy setup - Use extension for all proxy types (more reliable, especially for SOCKS5)
         if PROXY_HOST and PROXY_PORT:
-            # Build proxy URL with embedded credentials if available
-            if PROXY_USER and PROXY_PASS:
-                # Chrome supports auth in proxy URL: scheme://user:pass@host:port
-                proxy_url = f"{PROXY_SCHEME}://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
-                print(f"[INFO] Proxy with embedded auth: {PROXY_SCHEME}://{PROXY_USER}:***@{PROXY_HOST}:{PROXY_PORT}")
-            else:
-                proxy_url = f"{PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}"
-                print(f"[INFO] Proxy without auth: {proxy_url}")
-            
-            # Set proxy via command line argument (Chrome supports auth in URL)
-            options.add_argument(f"--proxy-server={proxy_url}")
-            
-            # Additional proxy-related arguments
-            options.add_argument("--proxy-bypass-list=<-loopback>")
+            try:
+                print(f"[INFO] Creating proxy extension for {PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}...")
+                self._proxy_ext_path = create_simple_proxy_extension(
+                    PROXY_HOST, 
+                    PROXY_PORT, 
+                    PROXY_SCHEME, 
+                    PROXY_USER if PROXY_USER else None,
+                    PROXY_PASS if PROXY_PASS else None
+                )
+                options.add_extension(self._proxy_ext_path)
+                
+                if PROXY_USER and PROXY_PASS:
+                    print(f"[INFO] ✅ Proxy extension loaded: {PROXY_SCHEME}://{PROXY_USER}:***@{PROXY_HOST}:{PROXY_PORT}")
+                else:
+                    print(f"[INFO] ✅ Proxy extension loaded: {PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}")
+            except Exception as e:
+                print(f"[ERROR] Failed to create proxy extension: {e}")
+                # Fallback to command-line proxy (may not work for SOCKS5 with auth)
+                if PROXY_USER and PROXY_PASS:
+                    proxy_url = f"{PROXY_SCHEME}://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+                else:
+                    proxy_url = f"{PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}"
+                options.add_argument(f"--proxy-server={proxy_url}")
+                print(f"[WARN] Using fallback proxy method: {proxy_url}")
         else:
             print("[INFO] No proxy configured; launching direct.")
 
@@ -276,43 +361,66 @@ try {
         # Extra stealth
         self._stealthify(self.driver)
 
-        # Verify proxy is working (optional)
-        if PROXY_HOST and PROXY_PORT and not SKIP_PROXY_VERIFY:
-            print("[INFO] Verifying proxy connection...")
-            time.sleep(1.0)  # Brief wait for browser to initialize
-            self._quick_proxy_check()
-        elif PROXY_HOST and PROXY_PORT:
-            print("[INFO] Proxy configured (verification skipped)")
+        # Wait for extension to initialize and verify proxy
+        if PROXY_HOST and PROXY_PORT:
+            print("[INFO] Waiting for proxy extension to initialize...")
+            time.sleep(2.5)  # Give extension time to load and configure proxy
+            
+            if not SKIP_PROXY_VERIFY:
+                self._quick_proxy_check()
+            else:
+                print("[INFO] Proxy verification skipped")
         else:
             print("[INFO] No proxy configured")
     
     def _quick_proxy_check(self):
         """Quick non-blocking proxy check"""
         try:
-            print("[VERIFY] Quick proxy check...")
-            self.driver.set_page_load_timeout(8)
-            self.driver.get("https://api.ipify.org/?format=text")
-            browser_ip = WebDriverWait(self.driver, 5).until(
-                lambda d: d.find_element(By.TAG_NAME, "body").text.strip()
-            )
-            print(f"[VERIFY] Browser IP: {browser_ip}")
+            print("[VERIFY] Checking proxy connection...")
+            self.driver.set_page_load_timeout(10)
             
-            # Compare with proxy IP if available
-            if PROXY_HOST and PROXY_PORT:
+            # Try multiple IP check services
+            ip_services = [
+                "https://api.ipify.org?format=text",
+                "https://icanhazip.com",
+                "https://ifconfig.me/ip"
+            ]
+            
+            browser_ip = None
+            for service_url in ip_services:
                 try:
-                    r = requests.get("https://api.ipify.org?format=json", 
-                                    proxies=REQUESTS_PROXIES, timeout=5)
-                    proxy_ip = r.json().get("ip", "")
-                    if browser_ip == proxy_ip:
-                        print("[VERIFY] ✅ Proxy working - IP matches")
-                    else:
-                        print(f"[VERIFY] ⚠️ Browser IP ({browser_ip}) != Proxy IP ({proxy_ip})")
+                    self.driver.get(service_url)
+                    browser_ip = WebDriverWait(self.driver, 6).until(
+                        lambda d: d.find_element(By.TAG_NAME, "body").text.strip()
+                    )
+                    # Check if we got an actual IP (not an error page)
+                    if browser_ip and len(browser_ip.split('.')) == 4:
+                        print(f"[VERIFY] Browser IP: {browser_ip}")
+                        break
                 except:
-                    pass
+                    continue
+            
+            if not browser_ip or len(browser_ip.split('.')) != 4:
+                print("[WARN] Could not determine browser IP - proxy may not be working")
+                self.driver.set_page_load_timeout(PAGELOAD_TIMEOUT)
+                return
+            
+            # Compare with proxy IP
+            try:
+                r = requests.get("https://api.ipify.org?format=json", 
+                                proxies=REQUESTS_PROXIES, timeout=5)
+                proxy_ip = r.json().get("ip", "")
+                if browser_ip == proxy_ip:
+                    print(f"[VERIFY] ✅ Proxy working correctly - IP matches: {browser_ip}")
+                else:
+                    print(f"[VERIFY] ⚠️ Browser IP ({browser_ip}) != Proxy IP ({proxy_ip})")
+                    print("[WARN] Browser may not be using proxy!")
+            except Exception as e:
+                print(f"[WARN] Could not verify proxy IP: {e}")
             
             self.driver.set_page_load_timeout(PAGELOAD_TIMEOUT)
         except Exception as e:
-            print(f"[WARN] Proxy check skipped: {e}")
+            print(f"[WARN] Proxy check failed: {e} - continuing anyway")
             try:
                 self.driver.set_page_load_timeout(PAGELOAD_TIMEOUT)
             except:
