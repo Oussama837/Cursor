@@ -235,8 +235,20 @@ class LocalProxyHandler(BaseHTTPRequestHandler):
                     return
     
     def log_message(self, format, *args):
-        # Suppress logs
-        pass
+        # Suppress normal logs, but log errors
+        if 'error' in format.lower() or 'exception' in format.lower():
+            print(f"[PROXY] {format % args}")
+    
+    def handle_one_request(self):
+        """Override to catch connection reset errors"""
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            # These are normal when Chrome closes connections - ignore them
+            pass
+        except Exception as e:
+            # Log other errors
+            print(f"[PROXY ERROR] {e}")
 
 def start_local_proxy(upstream_host, upstream_port, upstream_scheme, upstream_user, upstream_pass):
     """Start a local proxy server that adds authentication"""
@@ -428,11 +440,16 @@ def get_balance():
 
 # ----------- Main bot -----------
 class AnkamaAutoPhone:
+    # Class-level proxy server (shared across all instances)
+    _shared_proxy_server = None
+    _shared_proxy_port = None
+    
     def __init__(self):
         self.driver = None
         self._proxy_ext_path = None
-        self._local_proxy_server = None
-        self._local_proxy_port = None
+        # Use shared proxy server if available
+        self._local_proxy_server = AnkamaAutoPhone._shared_proxy_server
+        self._local_proxy_port = AnkamaAutoPhone._shared_proxy_port
 
     def random_delay(self, a=0.5, b=1.5):
         time.sleep(random.uniform(a, b))
@@ -527,28 +544,17 @@ try {
         options.add_argument("--disable-webrtc-hw-decoding")
         options.add_argument("--force-webrtc-ip-permission-check")
 
-        # Proxy setup - Use LOCAL PROXY SERVER for authenticated proxies (most reliable method)
+        # Proxy setup - Use SHARED LOCAL PROXY SERVER (started once before loop)
         if PROXY_HOST and PROXY_PORT:
             if PROXY_USER and PROXY_PASS:
-                # Start local proxy server that handles auth
-                print(f"[INFO] Starting local proxy server for {PROXY_SCHEME}://{PROXY_USER}:***@{PROXY_HOST}:{PROXY_PORT}...")
-                try:
-                    self._local_proxy_port, self._local_proxy_server = start_local_proxy(
-                        PROXY_HOST,
-                        PROXY_PORT,
-                        PROXY_SCHEME,
-                        PROXY_USER,
-                        PROXY_PASS
-                    )
-                    # Chrome connects to local proxy (no auth needed)
-                    options.add_argument(f"--proxy-server=http://127.0.0.1:{self._local_proxy_port}")
-                    print(f"[INFO] ✅ Local proxy server started on port {self._local_proxy_port}")
-                    print(f"[INFO] ✅ Chrome will connect to localhost:{self._local_proxy_port} (auth handled automatically)")
-                    time.sleep(1.0)  # Give proxy server time to start
-                except Exception as e:
-                    print(f"[ERROR] Failed to start local proxy server: {e}")
-                    print(f"[WARN] Falling back to extension method...")
-                    # Fallback to extension
+                # Use shared proxy server (started once before the loop)
+                if AnkamaAutoPhone._shared_proxy_port:
+                    # Chrome connects to shared local proxy (no auth needed)
+                    options.add_argument(f"--proxy-server=http://127.0.0.1:{AnkamaAutoPhone._shared_proxy_port}")
+                    print(f"[INFO] ✅ Using shared proxy server on port {AnkamaAutoPhone._shared_proxy_port}")
+                else:
+                    # Fallback to extension if shared proxy not available
+                    print(f"[WARN] Shared proxy not available, using extension fallback...")
                     self._proxy_ext_path = create_simple_proxy_extension(
                         PROXY_HOST, PROXY_PORT, PROXY_SCHEME, PROXY_USER, PROXY_PASS
                     )
@@ -584,9 +590,9 @@ try {
 
         # Wait and verify proxy
         if PROXY_HOST and PROXY_PORT:
-            if self._local_proxy_server:
-                # Local proxy is immediate, just brief wait
-                print("[INFO] Local proxy server ready (immediate)")
+            if AnkamaAutoPhone._shared_proxy_port:
+                # Shared local proxy is ready, just brief wait
+                print("[INFO] Shared proxy server ready (immediate)")
                 time.sleep(1.0)
             elif PROXY_USER and PROXY_PASS:
                 # Extension method - wait longer
@@ -908,11 +914,7 @@ try {
             try: 
                 self.driver.quit()
             except: pass
-            # Cleanup local proxy server
-            if self._local_proxy_server:
-                try:
-                    self._local_proxy_server.shutdown()
-                except: pass
+            # Don't cleanup shared proxy server - it's reused for all accounts
             return True
 
         except Exception as e:
@@ -920,11 +922,7 @@ try {
             try:
                 if self.driver: self.driver.quit()
             except: pass
-            # Cleanup local proxy server
-            if self._local_proxy_server:
-                try:
-                    self._local_proxy_server.shutdown()
-                except: pass
+            # Don't cleanup shared proxy server - it's reused for all accounts
             return False
 
 # ----------- Main -----------
@@ -935,6 +933,28 @@ if __name__ == "__main__":
 
     accounts = accounts_data.get("accounts", [])
     total = len(accounts)
+    
+    # Start shared proxy server ONCE before the loop (if needed)
+    if PROXY_HOST and PROXY_PORT and PROXY_USER and PROXY_PASS:
+        if AnkamaAutoPhone._shared_proxy_server is None:
+            print(f"\n[INFO] Starting shared local proxy server for {PROXY_SCHEME}://{PROXY_USER}:***@{PROXY_HOST}:{PROXY_PORT}...")
+            try:
+                AnkamaAutoPhone._shared_proxy_port, AnkamaAutoPhone._shared_proxy_server = start_local_proxy(
+                    PROXY_HOST,
+                    PROXY_PORT,
+                    PROXY_SCHEME,
+                    PROXY_USER,
+                    PROXY_PASS
+                )
+                print(f"[INFO] ✅ Shared proxy server started on port {AnkamaAutoPhone._shared_proxy_port}")
+                print(f"[INFO] ✅ This proxy will be reused for all accounts\n")
+                time.sleep(1.0)  # Give proxy server time to fully start
+            except Exception as e:
+                print(f"[ERROR] Failed to start proxy server: {e}")
+                import traceback
+                traceback.print_exc()
+                sys.exit(1)
+    
     verifier = AnkamaAutoPhone()
 
     for index, acc in enumerate(accounts):
@@ -968,3 +988,12 @@ if __name__ == "__main__":
             json.dump(accounts_data, f, indent=2, ensure_ascii=False)
 
         print("-" * 55 + "\n")
+    
+    # Cleanup: shutdown shared proxy server at the end
+    if AnkamaAutoPhone._shared_proxy_server:
+        try:
+            print("\n[INFO] Shutting down shared proxy server...")
+            AnkamaAutoPhone._shared_proxy_server.shutdown()
+            print("[INFO] ✅ Proxy server stopped")
+        except Exception as e:
+            print(f"[WARN] Error shutting down proxy server: {e}")
