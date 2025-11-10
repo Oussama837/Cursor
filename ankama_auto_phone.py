@@ -94,16 +94,16 @@ def create_simple_proxy_extension(proxy_host, proxy_port, proxy_scheme, proxy_us
         }
     }
     
-    # Build proxy config
+    # Build proxy config - ensure port is integer
     proxy_config = {
         "mode": "fixed_servers",
         "rules": {
             "singleProxy": {
                 "scheme": proxy_scheme,
                 "host": proxy_host,
-                "port": proxy_port
+                "port": int(proxy_port)  # Must be integer, not string
             },
-            "bypassList": ["localhost", "127.0.0.1"]
+            "bypassList": ["localhost", "127.0.0.1", "<-loopback>"]
         }
     }
     
@@ -343,17 +343,15 @@ try {
         options.add_argument("--disable-webrtc-hw-decoding")
         options.add_argument("--force-webrtc-ip-permission-check")
 
-        # Proxy setup - Use extension + command-line for maximum reliability
+        # Proxy setup - Use ONLY extension (command-line conflicts with extension)
         if PROXY_HOST and PROXY_PORT:
-            # Build proxy URL
+            # Build proxy display string
             if PROXY_USER and PROXY_PASS:
-                proxy_url = f"{PROXY_SCHEME}://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
                 proxy_display = f"{PROXY_SCHEME}://{PROXY_USER}:***@{PROXY_HOST}:{PROXY_PORT}"
             else:
-                proxy_url = f"{PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}"
-                proxy_display = proxy_url
+                proxy_display = f"{PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}"
             
-            # Method 1: Create and load extension (handles auth properly)
+            # Create and load extension (ONLY method - no command-line to avoid conflicts)
             try:
                 print(f"[INFO] Creating proxy extension for {proxy_display}...")
                 self._proxy_ext_path = create_simple_proxy_extension(
@@ -364,22 +362,11 @@ try {
                     PROXY_PASS if PROXY_PASS else None
                 )
                 options.add_extension(self._proxy_ext_path)
-                print(f"[INFO] ✅ Proxy extension loaded")
+                print(f"[INFO] ✅ Proxy extension loaded - using extension ONLY (no command-line to avoid conflicts)")
             except Exception as e:
                 print(f"[ERROR] Failed to create proxy extension: {e}")
-                self._proxy_ext_path = None
-            
-            # Method 2: Also set via command-line (backup/fallback)
-            # Note: For HTTP proxies, Chrome supports auth in URL
-            # For SOCKS5, extension is required for auth
-            if PROXY_SCHEME.lower() in ['http', 'https']:
-                # HTTP/HTTPS proxies can use command-line with embedded auth
-                options.add_argument(f"--proxy-server={proxy_url}")
-                print(f"[INFO] ✅ Proxy also set via command-line (backup)")
-            else:
-                # SOCKS5 needs extension for auth, but set without auth as backup
-                options.add_argument(f"--proxy-server={PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}")
-                print(f"[INFO] ✅ Proxy also set via command-line (without auth, extension handles auth)")
+                print(f"[ERROR] Cannot proceed without proxy extension!")
+                raise
         else:
             print("[INFO] No proxy configured; launching direct.")
 
@@ -406,23 +393,19 @@ try {
         # Wait for extension to initialize and verify proxy
         if PROXY_HOST and PROXY_PORT:
             print("[INFO] Waiting for proxy extension to initialize...")
-            time.sleep(3.0)  # Give extension time to load and configure proxy
+            # Longer wait to ensure extension is fully loaded
+            time.sleep(4.0)
             
-            # Verify extension loaded and proxy is set
+            # Navigate to a simple page to trigger extension initialization
             try:
-                # Check if extension is loaded by checking Chrome's proxy settings
-                proxy_info = self.driver.execute_cdp_cmd("Network.getCertificate", {"origin": "https://www.google.com"})
-            except:
-                pass
-            
-            # Force a small navigation to trigger extension
-            try:
+                print("[INFO] Triggering extension by navigating to about:blank...")
                 self.driver.get("about:blank")
-                time.sleep(1.0)
-            except:
-                pass
+                time.sleep(1.5)
+            except Exception as e:
+                print(f"[WARN] Navigation to trigger extension failed: {e}")
             
             if not SKIP_PROXY_VERIFY:
+                print("[INFO] Verifying proxy is working...")
                 self._quick_proxy_check()
             else:
                 print("[INFO] Proxy verification skipped")
@@ -433,71 +416,90 @@ try {
         """Quick non-blocking proxy check"""
         try:
             print("[VERIFY] Checking proxy connection...")
-            self.driver.set_page_load_timeout(12)
+            self.driver.set_page_load_timeout(15)
             
-            # Get proxy IP first (via requests)
+            # Get proxy IP first (via requests library)
             proxy_ip = None
             try:
                 r = requests.get("https://api.ipify.org?format=json", 
-                                proxies=REQUESTS_PROXIES, timeout=5)
+                                proxies=REQUESTS_PROXIES, timeout=8)
                 proxy_ip = r.json().get("ip", "")
-                print(f"[VERIFY] Expected proxy IP: {proxy_ip}")
+                print(f"[VERIFY] Expected proxy IP (via requests): {proxy_ip}")
             except Exception as e:
-                print(f"[WARN] Could not get proxy IP: {e}")
+                print(f"[WARN] Could not get proxy IP via requests: {e}")
             
-            # Try multiple IP check services
+            # Try multiple IP check services (start with simpler ones)
             ip_services = [
-                "https://api.ipify.org?format=text",
-                "https://icanhazip.com",
-                "https://ifconfig.me/ip",
-                "http://api.ipify.org?format=text"  # Try HTTP too
+                ("https://icanhazip.com", "HTTPS"),
+                ("http://icanhazip.com", "HTTP"),
+                ("https://ifconfig.me/ip", "HTTPS"),
+                ("http://ifconfig.me/ip", "HTTP"),
+                ("https://api.ipify.org?format=text", "HTTPS"),
+                ("http://api.ipify.org?format=text", "HTTP"),
             ]
             
             browser_ip = None
-            for service_url in ip_services:
+            last_error = None
+            for service_url, protocol in ip_services:
                 try:
-                    print(f"[VERIFY] Trying {service_url}...")
+                    print(f"[VERIFY] Trying {protocol} service: {service_url}...")
                     self.driver.get(service_url)
-                    browser_ip = WebDriverWait(self.driver, 8).until(
-                        lambda d: d.find_element(By.TAG_NAME, "body").text.strip()
+                    # Wait for page to load
+                    WebDriverWait(self.driver, 10).until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
                     )
-                    # Clean up IP (remove whitespace, newlines)
-                    browser_ip = browser_ip.strip().split()[0] if browser_ip else None
+                    # Get IP from page
+                    browser_ip = self.driver.find_element(By.TAG_NAME, "body").text.strip()
+                    # Clean up IP (remove whitespace, newlines, error messages)
+                    browser_ip = browser_ip.split()[0] if browser_ip else None
                     
                     # Check if we got an actual IP (not an error page)
-                    if browser_ip and '.' in browser_ip and len(browser_ip.split('.')) == 4:
-                        # Validate it's actually an IP
+                    if browser_ip and '.' in browser_ip:
                         parts = browser_ip.split('.')
-                        if all(0 <= int(p) <= 255 for p in parts if p.isdigit()):
-                            print(f"[VERIFY] Browser IP: {browser_ip}")
-                            break
+                        if len(parts) == 4:
+                            # Validate it's actually an IP (all parts are numbers 0-255)
+                            try:
+                                if all(0 <= int(p) <= 255 for p in parts if p.isdigit()):
+                                    print(f"[VERIFY] ✅ Browser IP detected: {browser_ip}")
+                                    break
+                            except ValueError:
+                                pass
                     browser_ip = None
                 except Exception as e:
-                    print(f"[VERIFY] Failed to get IP from {service_url}: {e}")
+                    last_error = str(e)
+                    # Check if it's a proxy error
+                    if "ERR_NO_SUPPORTED_PROXIES" in last_error or "ERR_PROXY" in last_error:
+                        print(f"[ERROR] Proxy error detected: {last_error}")
                     continue
             
             if not browser_ip:
-                print("[ERROR] ❌ Could not determine browser IP - proxy extension may not be working!")
-                print("[ERROR] The browser might be using your machine IP instead of proxy")
+                print("[ERROR] ❌ Could not determine browser IP!")
+                if last_error:
+                    print(f"[ERROR] Last error: {last_error}")
+                print("[ERROR] Proxy extension may not be working correctly")
                 self.driver.set_page_load_timeout(PAGELOAD_TIMEOUT)
                 return False
             
             # Compare with proxy IP
             if proxy_ip:
                 if browser_ip == proxy_ip:
-                    print(f"[VERIFY] ✅ Proxy working correctly - IP matches: {browser_ip}")
+                    print(f"[VERIFY] ✅✅✅ SUCCESS! Proxy working correctly - IP matches: {browser_ip}")
                     return True
                 else:
                     print(f"[VERIFY] ❌ Browser IP ({browser_ip}) != Proxy IP ({proxy_ip})")
                     print("[ERROR] Browser is NOT using the proxy! Extension may have failed.")
+                    print("[ERROR] Check extension logs or try increasing wait time")
                     return False
             else:
                 print(f"[VERIFY] Browser IP detected: {browser_ip} (could not verify against proxy IP)")
+                print("[WARN] Could not compare with proxy IP, but browser IP was detected")
                 return True
             
-            self.driver.set_page_load_timeout(PAGELOAD_TIMEOUT)
         except Exception as e:
             print(f"[WARN] Proxy check failed: {e} - continuing anyway")
+            import traceback
+            print(f"[DEBUG] Traceback: {traceback.format_exc()}")
+        finally:
             try:
                 self.driver.set_page_load_timeout(PAGELOAD_TIMEOUT)
             except:
