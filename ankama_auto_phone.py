@@ -20,7 +20,11 @@ import requests
 import warnings
 import tempfile
 import zipfile
+import threading
+import socket
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -92,6 +96,169 @@ function FindProxyForURL(url, host) {{
     pac_file.write(pac_content)
     pac_file.close()
     return pac_file.name
+
+class LocalProxyHandler(BaseHTTPRequestHandler):
+    """Local proxy server that adds authentication to upstream proxy"""
+    upstream_host = None
+    upstream_port = None
+    upstream_scheme = None
+    upstream_user = None
+    upstream_pass = None
+    
+    def do_CONNECT(self):
+        """Handle CONNECT method for HTTPS"""
+        try:
+            # Parse destination
+            host, port = self.path.split(':')
+            port = int(port)
+            
+            # Connect to upstream proxy
+            upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            upstream_sock.connect((self.upstream_host, self.upstream_port))
+            
+            # Send CONNECT request with auth
+            auth_str = f"{self.upstream_user}:{self.upstream_pass}"
+            import base64
+            auth_b64 = base64.b64encode(auth_str.encode()).decode()
+            connect_req = f"CONNECT {host}:{port} HTTP/1.1\r\n"
+            connect_req += f"Host: {host}:{port}\r\n"
+            connect_req += f"Proxy-Authorization: Basic {auth_b64}\r\n"
+            connect_req += "\r\n"
+            upstream_sock.sendall(connect_req.encode())
+            
+            # Read response
+            response = upstream_sock.recv(4096)
+            
+            # Forward response to client
+            self.wfile.write(response)
+            
+            # Tunnel data
+            self._tunnel(upstream_sock)
+            upstream_sock.close()
+        except Exception as e:
+            self.send_error(502, f"Proxy error: {e}")
+    
+    def do_GET(self):
+        self._proxy_request()
+    
+    def do_POST(self):
+        self._proxy_request()
+    
+    def do_PUT(self):
+        self._proxy_request()
+    
+    def do_DELETE(self):
+        self._proxy_request()
+    
+    def _proxy_request(self):
+        """Proxy HTTP requests"""
+        try:
+            # Get full URL from request
+            host = self.headers.get('Host', '')
+            if not host:
+                self.send_error(400, "Missing Host header")
+                return
+            
+            # Build full URL
+            if self.path.startswith('http'):
+                url = self.path
+            else:
+                scheme = 'https' if self.headers.get('X-Forwarded-Proto') == 'https' else 'http'
+                url = f"{scheme}://{host}{self.path}"
+            
+            # Prepare headers (remove hop-by-hop headers)
+            headers = {}
+            for key, value in self.headers.items():
+                key_lower = key.lower()
+                if key_lower not in ['host', 'connection', 'proxy-connection', 'transfer-encoding', 'upgrade']:
+                    headers[key] = value
+            
+            # Use requests with proxy auth
+            proxy_url = f"{self.upstream_scheme}://{self.upstream_user}:{self.upstream_pass}@{self.upstream_host}:{self.upstream_port}"
+            proxies = {
+                'http': proxy_url,
+                'https': proxy_url
+            }
+            
+            # Read request body if present
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length) if content_length > 0 else None
+            
+            # Forward request through proxy
+            resp = requests.request(
+                self.command,
+                url,
+                headers=headers,
+                data=body,
+                stream=True,
+                proxies=proxies,
+                timeout=30,
+                allow_redirects=False
+            )
+            
+            # Send response
+            self.send_response(resp.status_code)
+            for key, value in resp.headers.items():
+                key_lower = key.lower()
+                if key_lower not in ['connection', 'transfer-encoding', 'content-encoding']:
+                    self.send_header(key, value)
+            self.end_headers()
+            
+            # Stream response body
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    self.wfile.write(chunk)
+                    
+        except Exception as e:
+            import traceback
+            print(f"[PROXY ERROR] {e}")
+            print(traceback.format_exc())
+            self.send_error(502, f"Proxy error: {e}")
+    
+    def _tunnel(self, upstream_sock):
+        """Tunnel data between client and upstream"""
+        import select
+        while True:
+            r, w, x = select.select([self.connection, upstream_sock], [], [], 1)
+            if not r:
+                break
+            for sock in r:
+                try:
+                    data = sock.recv(8192)
+                    if not data:
+                        return
+                    if sock is self.connection:
+                        upstream_sock.sendall(data)
+                    else:
+                        self.connection.sendall(data)
+                except:
+                    return
+    
+    def log_message(self, format, *args):
+        # Suppress logs
+        pass
+
+def start_local_proxy(upstream_host, upstream_port, upstream_scheme, upstream_user, upstream_pass):
+    """Start a local proxy server that adds authentication"""
+    # Find available port
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(('127.0.0.1', 0))
+    local_port = sock.getsockname()[1]
+    sock.close()
+    
+    # Configure handler
+    LocalProxyHandler.upstream_host = upstream_host
+    LocalProxyHandler.upstream_port = upstream_port
+    LocalProxyHandler.upstream_scheme = upstream_scheme
+    LocalProxyHandler.upstream_user = upstream_user
+    LocalProxyHandler.upstream_pass = upstream_pass
+    
+    # Start server
+    server = HTTPServer(('127.0.0.1', local_port), LocalProxyHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    
+    return local_port, server
 
 def create_simple_proxy_extension(proxy_host, proxy_port, proxy_scheme, proxy_user=None, proxy_pass=None):
     """
@@ -264,6 +431,8 @@ class AnkamaAutoPhone:
     def __init__(self):
         self.driver = None
         self._proxy_ext_path = None
+        self._local_proxy_server = None
+        self._local_proxy_port = None
 
     def random_delay(self, a=0.5, b=1.5):
         time.sleep(random.uniform(a, b))
@@ -358,28 +527,35 @@ try {
         options.add_argument("--disable-webrtc-hw-decoding")
         options.add_argument("--force-webrtc-ip-permission-check")
 
-        # Proxy setup - ALWAYS use extension for authenticated proxies (Chrome doesn't support auth in --proxy-server)
+        # Proxy setup - Use LOCAL PROXY SERVER for authenticated proxies (most reliable method)
         if PROXY_HOST and PROXY_PORT:
-            proxy_display = f"{PROXY_SCHEME}://{PROXY_USER}:***@{PROXY_HOST}:{PROXY_PORT}" if (PROXY_USER and PROXY_PASS) else f"{PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}"
-            
-            # Always use extension when auth is required (Chrome's --proxy-server doesn't support embedded credentials properly)
             if PROXY_USER and PROXY_PASS:
-                print(f"[INFO] Creating proxy extension for {proxy_display}...")
+                # Start local proxy server that handles auth
+                print(f"[INFO] Starting local proxy server for {PROXY_SCHEME}://{PROXY_USER}:***@{PROXY_HOST}:{PROXY_PORT}...")
                 try:
-                    self._proxy_ext_path = create_simple_proxy_extension(
-                        PROXY_HOST, 
-                        PROXY_PORT, 
-                        PROXY_SCHEME, 
+                    self._local_proxy_port, self._local_proxy_server = start_local_proxy(
+                        PROXY_HOST,
+                        PROXY_PORT,
+                        PROXY_SCHEME,
                         PROXY_USER,
                         PROXY_PASS
                     )
-                    options.add_extension(self._proxy_ext_path)
-                    print(f"[INFO] ✅ Proxy extension loaded (required for authenticated proxies)")
+                    # Chrome connects to local proxy (no auth needed)
+                    options.add_argument(f"--proxy-server=http://127.0.0.1:{self._local_proxy_port}")
+                    print(f"[INFO] ✅ Local proxy server started on port {self._local_proxy_port}")
+                    print(f"[INFO] ✅ Chrome will connect to localhost:{self._local_proxy_port} (auth handled automatically)")
+                    time.sleep(1.0)  # Give proxy server time to start
                 except Exception as e:
-                    print(f"[ERROR] Failed to create proxy extension: {e}")
-                    raise
+                    print(f"[ERROR] Failed to start local proxy server: {e}")
+                    print(f"[WARN] Falling back to extension method...")
+                    # Fallback to extension
+                    self._proxy_ext_path = create_simple_proxy_extension(
+                        PROXY_HOST, PROXY_PORT, PROXY_SCHEME, PROXY_USER, PROXY_PASS
+                    )
+                    options.add_extension(self._proxy_ext_path)
+                    print(f"[INFO] ✅ Using proxy extension as fallback")
             else:
-                # No auth - can use command-line
+                # No auth - use command-line directly
                 proxy_url = f"{PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}"
                 options.add_argument(f"--proxy-server={proxy_url}")
                 print(f"[INFO] ✅ Using Chrome native proxy (no auth): {proxy_url}")
@@ -408,14 +584,17 @@ try {
 
         # Wait and verify proxy
         if PROXY_HOST and PROXY_PORT:
-            # If using extension (authenticated proxies), wait for it to initialize
-            if PROXY_USER and PROXY_PASS:
+            if self._local_proxy_server:
+                # Local proxy is immediate, just brief wait
+                print("[INFO] Local proxy server ready (immediate)")
+                time.sleep(1.0)
+            elif PROXY_USER and PROXY_PASS:
+                # Extension method - wait longer
                 print("[INFO] Waiting for proxy extension to initialize...")
-                time.sleep(4.0)  # Longer wait for extension
+                time.sleep(4.0)
                 try:
-                    print("[INFO] Triggering extension by navigating...")
                     self.driver.get("about:blank")
-                    time.sleep(2.0)  # Give extension time to set proxy
+                    time.sleep(2.0)
                 except Exception as e:
                     print(f"[WARN] Navigation failed: {e}")
             else:
@@ -427,10 +606,10 @@ try {
                 print("[INFO] Verifying proxy is working...")
                 try:
                     proxy_working = self._quick_proxy_check()
-                    if not proxy_working:
-                        print("[WARN] ⚠️ Proxy verification failed!")
-                        print("[WARN] This might be a false negative - proxy may still work for actual websites")
-                        print("[WARN] Continuing execution...")
+                    if proxy_working:
+                        print("[INFO] ✅ Proxy verification passed!")
+                    else:
+                        print("[WARN] ⚠️ Proxy verification failed, but continuing...")
                 except Exception as e:
                     print(f"[WARN] Proxy verification error: {e}")
                     print("[WARN] Continuing anyway - proxy may still work")
@@ -726,8 +905,14 @@ try {
                 return False
 
             close_number(tzid)
-            try: self.driver.quit()
+            try: 
+                self.driver.quit()
             except: pass
+            # Cleanup local proxy server
+            if self._local_proxy_server:
+                try:
+                    self._local_proxy_server.shutdown()
+                except: pass
             return True
 
         except Exception as e:
@@ -735,6 +920,11 @@ try {
             try:
                 if self.driver: self.driver.quit()
             except: pass
+            # Cleanup local proxy server
+            if self._local_proxy_server:
+                try:
+                    self._local_proxy_server.shutdown()
+                except: pass
             return False
 
 # ----------- Main -----------
