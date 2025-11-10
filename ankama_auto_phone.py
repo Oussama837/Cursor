@@ -629,9 +629,20 @@ try {
             if hasattr(options, '_experimental_options'):
                 for key, value in options._experimental_options.items():
                     options_retry.add_experimental_option(key, value)
-            # Re-add extensions
-            if hasattr(self, '_proxy_ext_path') and self._proxy_ext_path:
-                options_retry.add_extension(self._proxy_ext_path)
+            # Re-add extensions (check if file exists first)
+            if PROXY_HOST and PROXY_PORT and PROXY_USER and PROXY_PASS:
+                if hasattr(self, '_proxy_ext_path') and self._proxy_ext_path and Path(self._proxy_ext_path).exists():
+                    options_retry.add_extension(self._proxy_ext_path)
+                    print(f"[INFO] Re-added proxy extension")
+                else:
+                    # Extension file missing, recreate it
+                    print(f"[WARN] Extension file missing, recreating...")
+                    self._proxy_ext_path = create_simple_proxy_extension(
+                        PROXY_HOST, PROXY_PORT, PROXY_SCHEME, PROXY_USER, PROXY_PASS
+                    )
+                    options_retry.add_extension(self._proxy_ext_path)
+                    options_retry.add_argument(f"--proxy-server={PROXY_SCHEME}://{PROXY_HOST}:{PROXY_PORT}")
+                    print(f"[INFO] Recreated and added proxy extension")
             try:
                 driver = uc.Chrome(options=options_retry)
                 print("[INFO] Chrome launched successfully (without version pinning)")
