@@ -10,6 +10,11 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency
+    load_dotenv = None
+
 
 ITERATIONS = 5
 IP_CHECK_URL = "https://api.ipify.org?format=json"
@@ -161,6 +166,14 @@ def verify_proxy_iteration(iteration: int, proxy_url: str, config: dict) -> None
 
 
 def main() -> None:
+    if load_dotenv:
+        load_dotenv()
+    else:
+        logging.info(
+            "python-dotenv not installed; environment variables will be read from the "
+            "current process only."
+        )
+
     config = get_env_config()
     required = ["proxy_host", "proxy_port", "proxy_scheme"]
     missing = [field for field in required if not config.get(field)]
