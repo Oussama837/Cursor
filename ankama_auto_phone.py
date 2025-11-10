@@ -613,18 +613,30 @@ try {
         else:
             print("[INFO] No proxy configured; launching direct.")
 
-        # Launch Chrome
+        # Launch Chrome - options object cannot be reused, so we use it once
         print("[INFO] Launching Chrome browser...")
         try:
             driver = uc.Chrome(options=options, version_main=142)
             print("[INFO] Chrome launched successfully")
-        except Exception:
-            print("[WARN] Failed to launch with version_main=142, trying without version pinning...")
+        except Exception as e:
+            print(f"[WARN] Failed to launch with version_main=142: {e}")
+            print("[WARN] Trying without version pinning...")
+            # Cannot reuse options object - need to rebuild it
+            # Create fresh options
+            options_retry = uc.ChromeOptions()
+            for arg in options.arguments:
+                options_retry.add_argument(arg)
+            if hasattr(options, '_experimental_options'):
+                for key, value in options._experimental_options.items():
+                    options_retry.add_experimental_option(key, value)
+            # Re-add extensions
+            if hasattr(self, '_proxy_ext_path') and self._proxy_ext_path:
+                options_retry.add_extension(self._proxy_ext_path)
             try:
-                driver = uc.Chrome(options=options)
+                driver = uc.Chrome(options=options_retry)
                 print("[INFO] Chrome launched successfully (without version pinning)")
-            except Exception as e:
-                print(f"[ERROR] Failed to launch Chrome: {e}")
+            except Exception as e2:
+                print(f"[ERROR] Failed to launch Chrome: {e2}")
                 raise
 
         self.driver = driver
